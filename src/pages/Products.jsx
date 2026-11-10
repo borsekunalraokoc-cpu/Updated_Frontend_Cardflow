@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback, useDeferredValue, memo } from 'react'
 import { API } from '../api'
 import { useAuth } from '../context/AuthContext'
 import { useData } from '../context/DataContext'
@@ -10,9 +10,38 @@ import AddModal from '../components/products/AddModal'
 
 const PAGE_SIZE = 20
 const PIPE_STAGES = STAGES.filter((s) => s.k !== 'finalqc')
+const ALL_PIPE_KEYS = PIPE_STAGES.map((s) => s.k)
+const EMPTY = []
 const lc = (s) => (s || '').trim().toLowerCase()
+const ts = (iso) => (iso ? Date.parse(iso) || 0 : 0)
+
+/* ---------- pure helpers (module level so they never change identity) ---------- */
 const isQcFlagged = (stg) =>
   stg?.status === 'In Progress' && String(stg?.comments || '').startsWith('QC flagged:')
+
+const stageHasOpenIssue = (p, k) => {
+  const stg = p.stages?.[k]
+  return !!stg && (stg.status === 'Issue' || isQcFlagged(stg))
+}
+
+const cardHasOpenIssue = (p) => {
+  if (p.verdict === 'Approved') return false
+  if (p.verdict === 'Issues Found') return true
+  return ALL_PIPE_KEYS.some((k) => stageHasOpenIssue(p, k))
+}
+
+const cardHasOpenIssueInStages = (p, stageKeys) => {
+  if (p.verdict === 'Approved' || !stageKeys || stageKeys.length === 0) return false
+  if (stageKeys.some((k) => stageHasOpenIssue(p, k))) return true
+  // "Issues Found" with no stage flagged → show to anyone on the card
+  return p.verdict === 'Issues Found' && !ALL_PIPE_KEYS.some((k) => stageHasOpenIssue(p, k))
+}
+
+const countCardIssueInstances = (p, stageKeys) => {
+  const keys = stageKeys || ALL_PIPE_KEYS
+  const n = keys.filter((k) => stageHasOpenIssue(p, k)).length
+  return n === 0 && p.verdict === 'Issues Found' ? 1 : n
+}
 
 // Are all the stages in these assignment rows finished on this card?
 function stagesDoneFor(p, rows) {
@@ -40,6 +69,72 @@ const bigSelect = {
 }
 const smallBtn = { padding: '6px 10px', fontSize: 12 }
 
+/* ---------- memoized row wrapper ----------
+   Only re-renders when its own card / open / selected state changes,
+   so opening one card or ticking one checkbox doesn't redraw all 20. */
+const MemoRow = memo(function MemoRow({
+  p,
+  isOpen,
+  isSelected,
+  onToggleId,
+  onSelectId,
+  onStage,
+  onQC,
+  onRemove,
+  allowedStages,
+  cardStages,
+  skuRows,
+  filterMember,
+  operator,
+  assignedTo,
+}) {
+  const hasCardStages = !!cardStages && cardStages.size > 0
+
+  // narrow to the stages this person was assigned on this card
+  const effectiveAllowedStages = useMemo(() => {
+    if (!hasCardStages) return allowedStages
+    return allowedStages ? allowedStages.filter((s) => cardStages.has(s)) : [...cardStages]
+  }, [hasCardStages, cardStages, allowedStages])
+
+  // member-level done/pending for their own stages (no QC gate)
+  const memberComplete = hasCardStages
+    ? [...cardStages].every((k) => p.stages?.[k]?.status === 'Completed')
+    : null
+
+  const memberStages = useMemo(() => {
+    if (!filterMember) return EMPTY
+    return skuRows
+      .filter((a) => a.memberId === filterMember)
+      .map((a) => ({
+        stage: a.stage,
+        stageName: STAGES.find((s) => s.k === a.stage)?.n || a.stage,
+        stageStatus: p.stages?.[a.stage]?.status || 'Not Started',
+        memberId: a.memberId,
+      }))
+  }, [filterMember, skuRows, p])
+
+  const toggle = useCallback(() => onToggleId(p.id), [onToggleId, p.id])
+  const onSelect = useCallback(() => onSelectId(p.id), [onSelectId, p.id])
+
+  return (
+    <ProductRow
+      p={p}
+      open={isOpen}
+      toggle={toggle}
+      onStage={onStage}
+      onQC={onQC}
+      onRemove={onRemove}
+      allowedStages={effectiveAllowedStages}
+      selected={isSelected}
+      onSelect={onSelect}
+      operator={operator}
+      assignedTo={assignedTo}
+      memberStages={memberStages}
+      memberComplete={memberComplete}
+    />
+  )
+})
+
 export default function Products({ products, allDivProducts, allowedStages, initialFilter, onFilterConsumed }) {
   const { auth, operator } = useAuth()
   const {
@@ -54,7 +149,7 @@ export default function Products({ products, allDivProducts, allowedStages, init
     removeProduct,
     addVendor,
   } = useData()
-  const vendors = allVendors[division] || []
+  const vendors = allVendors[division] || EMPTY
 
   const isFullAccess = allowedStages === null
   const isMasterOrAdmin = auth?.role === 'master' || auth?.role === 'admin'
@@ -68,6 +163,7 @@ export default function Products({ products, allDivProducts, allowedStages, init
 
   /* ---------- UI state ---------- */
   const [q, setQ] = useState('')
+  const deferredQ = useDeferredValue(q) // typing stays snappy; heavy filtering catches up
   const [open, setOpen] = useState({})
   const [modal, setModal] = useState(false)
   const [showSug, setShowSug] = useState(false)
@@ -139,10 +235,11 @@ export default function Products({ products, allDivProducts, allowedStages, init
 
   // auto-open the card when the search is an exact SKU
   useEffect(() => {
-    if (!q) return
-    const match = products.find((p) => lc(p.sku) === lc(q))
+    if (!deferredQ) return
+    const needle = lc(deferredQ)
+    const match = products.find((p) => lc(p.sku) === needle)
     if (match) setOpen((o) => (o[match.id] ? o : { ...o, [match.id]: true }))
-  }, [q, products])
+  }, [deferredQ, products])
 
   // header "Add product" button calls this
   useEffect(() => {
@@ -154,15 +251,38 @@ export default function Products({ products, allDivProducts, allowedStages, init
     }
   }, [isFullAccess])
 
+  /* ============ INDEXES (built once per data change, O(1) lookups after) ============ */
+  const divAssignments = useMemo(
+    () => assignments.filter((a) => a.division === division),
+    [assignments, division]
+  )
+
+  // sku -> assignment rows for this division
+  const rowsBySku = useMemo(() => {
+    const m = new Map()
+    for (const a of divAssignments) {
+      const k = lc(a.sku)
+      if (!k) continue
+      let arr = m.get(k)
+      if (!arr) m.set(k, (arr = []))
+      arr.push(a)
+    }
+    return m
+  }, [divAssignments])
+
+  const rowsFor = useCallback((sku) => rowsBySku.get(sku) || EMPTY, [rowsBySku])
+
+  const memberById = useMemo(() => new Map(teamMembers.map((m) => [m.id, m])), [teamMembers])
+
   /* ---------- assignment maps ---------- */
   // sku -> Set(stage keys) THIS member was specifically assigned
   const myAssignedStagesPerSku = useMemo(() => {
     if (!auth || isMasterOrAdmin) return null
     const map = {}
-    assignments
-      .filter((a) => a.memberId === myMemberId && a.division === division)
+    divAssignments
+      .filter((a) => a.memberId === myMemberId)
       .forEach((a) => {
-        const key = a.sku.toLowerCase()
+        const key = lc(a.sku)
         if (!map[key]) map[key] = new Set()
         if (a.stage && a.stage !== 'all')
           a.stage
@@ -172,55 +292,55 @@ export default function Products({ products, allDivProducts, allowedStages, init
             .forEach((s) => map[key].add(s))
       })
     return map
-  }, [auth, isMasterOrAdmin, assignments, myMemberId, division])
+  }, [auth, isMasterOrAdmin, divAssignments, myMemberId])
 
   // sku -> [{ memberId, memberName, stage }] for cards this manager pushed (or holds)
   const skuAssignedTo = useMemo(() => {
     if (!hasAssignAccess) return {}
     const managerIdForRows = isMasterOrAdmin ? 'master' : myMemberId
     const map = {}
-    assignments
-      .filter((a) => a.division === division && (a.managerId === managerIdForRows || a.memberId === myMemberId))
+    divAssignments
+      .filter((a) => a.managerId === managerIdForRows || a.memberId === myMemberId)
       .forEach((a) => {
-        const member = teamMembers.find((m) => m.id === a.memberId)
+        const member = memberById.get(a.memberId)
         ;(map[lc(a.sku)] ||= []).push({ memberId: a.memberId, memberName: member?.name || '—', stage: a.stage })
       })
     return map
-  }, [assignments, teamMembers, division, hasAssignAccess, isMasterOrAdmin, myMemberId])
+  }, [divAssignments, memberById, hasAssignAccess, isMasterOrAdmin, myMemberId])
 
   // sku -> [{ stage, assignedAt }] for the "Assigned between dates" filter
   const skuAssignDates = useMemo(() => {
     const map = {}
-    assignments
-      .filter((a) => a.division === division)
-      .forEach((a) => (map[lc(a.sku)] ||= []).push({ stage: a.stage, assignedAt: a.assignedAt }))
+    divAssignments.forEach((a) => (map[lc(a.sku)] ||= []).push({ stage: a.stage, assignedAt: a.assignedAt }))
     return map
-  }, [assignments, division])
+  }, [divAssignments])
 
   // per-member card lists for the member dropdown
   const memberStats = useMemo(() => {
-    if (!hasAssignAccess) return []
+    if (!hasAssignAccess) return EMPTY
     const managerIdForRows = isMasterOrAdmin ? 'master' : myMemberId
     const memberMap = {}
-    assignments
-      .filter((a) => a.division === division && a.managerId === managerIdForRows)
+    divAssignments
+      .filter((a) => a.managerId === managerIdForRows)
       .forEach((a) => {
         const sku = lc(a.sku)
         if (!a.memberId || !sku) return
         if (!memberMap[a.memberId]) {
-          const m = teamMembers.find((x) => x.id === a.memberId)
+          const m = memberById.get(a.memberId)
           memberMap[a.memberId] = { id: a.memberId, name: m?.name || a.memberId, skus: new Set() }
         }
         memberMap[a.memberId].skus.add(sku)
       })
     return Object.values(memberMap).sort((a, b) => a.name.localeCompare(b.name))
-  }, [assignments, division, hasAssignAccess, isMasterOrAdmin, myMemberId, teamMembers])
+  }, [divAssignments, hasAssignAccess, isMasterOrAdmin, myMemberId, memberById])
+
+  const memberStatsById = useMemo(() => new Map(memberStats.map((m) => [m.id, m])), [memberStats])
 
   // SKUs assigned directly to me (any assigner)
   const myOwnSkus = useMemo(() => {
     if (!hasAssignAccess || !myMemberId) return new Set()
-    return new Set(assignments.filter((a) => a.division === division && a.memberId === myMemberId).map((a) => lc(a.sku)))
-  }, [assignments, division, hasAssignAccess, myMemberId])
+    return new Set(divAssignments.filter((a) => a.memberId === myMemberId).map((a) => lc(a.sku)))
+  }, [divAssignments, hasAssignAccess, myMemberId])
 
   /* ---------- dropdown options ---------- */
   const setNoOptions = useMemo(() => [...new Set(products.map((p) => p.set_no).filter(Boolean))].sort(), [products])
@@ -240,68 +360,70 @@ export default function Products({ products, allDivProducts, allowedStages, init
     return [...names].sort()
   }, [skuAssignedTo])
 
-  const sourceProducts =
-    hasAssignAccess && ['assigned', 'completed', 'pending'].includes(assignTab) ? allDivProducts || products : products
+  const sourceProducts = useMemo(
+    () =>
+      hasAssignAccess && ['assigned', 'completed', 'pending'].includes(assignTab)
+        ? allDivProducts || products
+        : products,
+    [hasAssignAccess, assignTab, allDivProducts, products]
+  )
 
-  /* ---------- issue helpers ---------- */
-  const stageHasOpenIssue = (p, k) => {
-    const stg = p.stages?.[k]
-    return !!stg && (stg.status === 'Issue' || isQcFlagged(stg))
-  }
-  const cardHasOpenIssue = (p) => {
-    if (p.verdict === 'Approved') return false
-    if (p.verdict === 'Issues Found') return true
-    return PIPE_STAGES.some((s) => stageHasOpenIssue(p, s.k))
-  }
-  const cardHasOpenIssueInStages = (p, stageKeys) => {
-    if (p.verdict === 'Approved' || !stageKeys || stageKeys.length === 0) return false
-    if (stageKeys.some((k) => stageHasOpenIssue(p, k))) return true
-    // "Issues Found" with no stage flagged → show to anyone on the card
-    return p.verdict === 'Issues Found' && !PIPE_STAGES.some((s) => stageHasOpenIssue(p, s.k))
-  }
-  const countCardIssueInstances = (p, stageKeys) => {
-    const keys = stageKeys || PIPE_STAGES.map((s) => s.k)
-    const n = keys.filter((k) => stageHasOpenIssue(p, k)).length
-    return n === 0 && p.verdict === 'Issues Found' ? 1 : n
-  }
+  /* ---------- per-person issue helpers ---------- */
   // stages this logged-in person is responsible for on this card
-  const myStageKeysOnCard = (p) => {
-    const cardStages = myAssignedStagesPerSku?.[p.sku.toLowerCase()]
-    if (cardStages && cardStages.size > 0) return [...cardStages]
-    return allowedStages ? [...allowedStages] : PIPE_STAGES.map((s) => s.k)
-  }
-  const cardHasOpenIssueForMe = (p) => cardHasOpenIssueInStages(p, myStageKeysOnCard(p))
+  const myStageKeysOnCard = useCallback(
+    (p) => {
+      const cardStages = myAssignedStagesPerSku?.[lc(p.sku)]
+      if (cardStages && cardStages.size > 0) return [...cardStages]
+      return allowedStages ? [...allowedStages] : ALL_PIPE_KEYS
+    },
+    [myAssignedStagesPerSku, allowedStages]
+  )
+  const cardHasOpenIssueForMe = useCallback(
+    (p) => cardHasOpenIssueInStages(p, myStageKeysOnCard(p)),
+    [myStageKeysOnCard]
+  )
+
+  const myRowsFor = useCallback(
+    (p) => rowsFor(lc(p.sku)).filter((a) => a.memberId === myMemberId),
+    [rowsFor, myMemberId]
+  )
 
   // master's card-level counts (one per SKU, same maths as Overview)
   const masterCardCounts = useMemo(() => {
     if (!isMasterOrAdmin) return null
     const pool = allDivProducts || products
-    const completed = pool.filter((p) => p.verdict === 'Approved').length
-    const issuesFound = pool.filter((p) => p.verdict === 'Issues Found').length
-    return {
-      assigned: pool.filter((p) => !!skuAssignedTo[lc(p.sku)]).length,
-      completed,
-      pending: pool.length - completed - issuesFound,
+    let completed = 0
+    let issuesFound = 0
+    let assigned = 0
+    for (const p of pool) {
+      if (p.verdict === 'Approved') completed++
+      else if (p.verdict === 'Issues Found') issuesFound++
+      if (skuAssignedTo[lc(p.sku)]) assigned++
     }
+    return { assigned, completed, pending: pool.length - completed - issuesFound }
   }, [isMasterOrAdmin, allDivProducts, products, skuAssignedTo])
 
-  const myRowsFor = (p) =>
-    assignments.filter((a) => a.division === division && a.memberId === myMemberId && lc(a.sku) === lc(p.sku))
+  /* ============ THE FILTERED LIST (memoized) ============ */
+  const filtered = useMemo(() => {
+    const needle = deferredQ.toLowerCase()
+    const fromT = fEventFrom ? new Date(fEventFrom + 'T00:00:00').getTime() : null
+    const toT = fEventTo ? new Date(fEventTo + 'T23:59:59.999').getTime() : null
+    const inRange = (iso) => {
+      if (!iso) return false
+      const t = Date.parse(iso)
+      if (isNaN(t)) return false
+      if (fromT !== null && t < fromT) return false
+      if (toT !== null && t > toT) return false
+      return true
+    }
+    const eventStages = fStage ? [fStage] : stageFilterOptions.map((s) => s.k)
+    const stalledCutoff = fStalledDays ? Date.now() - Number(fStalledDays) * 86400000 : null
+    const completionScopeId = filterMember || (!isMasterOrAdmin ? myMemberId : null)
+    const filterMemberStats = filterMember ? memberStatsById.get(filterMember) : null
 
-  /* ---------- the filtered list ---------- */
-  const inRange = (iso) => {
-    if (!iso) return false
-    const d = new Date(iso)
-    if (isNaN(d.getTime())) return false
-    if (fEventFrom && d < new Date(fEventFrom + 'T00:00:00')) return false
-    if (fEventTo && d > new Date(fEventTo + 'T23:59:59.999')) return false
-    return true
-  }
-
-  const filtered = sourceProducts
-    .filter((p) => {
+    const result = sourceProducts.filter((p) => {
       const sku = lc(p.sku)
-      if (!`${p.sku} ${p.name || ''} ${p.vendor || ''}`.toLowerCase().includes(q.toLowerCase())) return false
+      if (needle && !`${p.sku} ${p.name || ''} ${p.vendor || ''}`.toLowerCase().includes(needle)) return false
 
       if (fStatus === 'issue') {
         if (!cardHasOpenIssueForMe(p)) return false
@@ -309,18 +431,17 @@ export default function Products({ products, allDivProducts, allowedStages, init
 
       // "when it happened" filter
       if (fEventType && (fEventFrom || fEventTo)) {
-        const stagesToCheck = fStage ? [fStage] : stageFilterOptions.map((s) => s.k)
         if (fEventType === 'assigned') {
-          const rows = skuAssignDates[sku] || []
+          const rows = skuAssignDates[sku] || EMPTY
           if (!rows.some((r) => (!fStage || r.stage === fStage || r.stage === 'all') && inRange(r.assignedAt))) return false
         } else {
           const target = { inprogress: 'In Progress', completed: 'Completed', issue: 'Issue' }[fEventType]
-          if (!stagesToCheck.some((k) => p.stages?.[k]?.status === target && inRange(p.stages[k].at))) return false
+          if (!eventStages.some((k) => p.stages?.[k]?.status === target && inRange(p.stages[k].at))) return false
         }
       }
 
       if (fAssignee) {
-        const rows = skuAssignedTo[sku] || []
+        const rows = skuAssignedTo[sku] || EMPTY
         if (auth?.name && fAssignee === auth.name) {
           // my own name = cards I still hold myself, not ones I pushed on
           if (!(rows.length > 0 && rows.every((r) => r.memberName === fAssignee))) return false
@@ -338,12 +459,10 @@ export default function Products({ products, allDivProducts, allowedStages, init
         } else if (st !== fStageStatus) return false
       }
 
-      if (fHasIssue && !myStageKeysOnCard(p).some((k) => p.stages[k]?.status === 'Issue')) return false
+      if (fHasIssue && !myStageKeysOnCard(p).some((k) => p.stages?.[k]?.status === 'Issue')) return false
 
-      if (fStalledDays) {
-        const cutoff = Date.now() - Number(fStalledDays) * 86400000
-        const updated = p.updatedAt ? new Date(p.updatedAt).getTime() : 0
-        if (productState(p) === 'done' || updated >= cutoff) return false
+      if (stalledCutoff !== null) {
+        if (productState(p) === 'done' || ts(p.updatedAt) >= stalledCutoff) return false
       }
 
       if (fQcVerdict === 'pending' && p.verdict) return false
@@ -352,13 +471,10 @@ export default function Products({ products, allDivProducts, allowedStages, init
 
       // Completed / Pending dropdown
       if (fCompletion) {
-        const scopeId = filterMember || (!isMasterOrAdmin ? myMemberId : null)
-        const rows = assignments.filter(
-          (a) => a.division === division && (!scopeId || a.memberId === scopeId) && lc(a.sku) === sku
-        )
+        const rows = rowsFor(sku).filter((a) => !completionScopeId || a.memberId === completionScopeId)
         if (rows.length === 0) return false
         const done = stagesDoneFor(p, rows)
-        const isDone = isMasterOrAdmin && !scopeId ? done && p.verdict === 'Approved' : done
+        const isDone = isMasterOrAdmin && !completionScopeId ? done && p.verdict === 'Approved' : done
         if (fCompletion === 'completed' && !isDone) return false
         if (fCompletion === 'pending' && isDone) return false
       }
@@ -370,12 +486,9 @@ export default function Products({ products, allDivProducts, allowedStages, init
         if (assignTab === 'assigned' && !isAssigned) return false
         if (assignTab === 'completed' || assignTab === 'pending') {
           const overall = isMasterOrAdmin && !filterMember
-          const relevant = filterMember
-            ? assignments.filter((a) => a.memberId === filterMember)
-            : isMasterOrAdmin
-            ? assignments
-            : assignments.filter((a) => a.memberId === myMemberId)
-          const rows = relevant.filter((a) => a.division === division && lc(a.sku) === sku)
+          const rows = rowsFor(sku).filter((a) =>
+            filterMember ? a.memberId === filterMember : isMasterOrAdmin ? true : a.memberId === myMemberId
+          )
           if (rows.length === 0) return false
 
           const done = stagesDoneFor(p, rows)
@@ -383,7 +496,7 @@ export default function Products({ products, allDivProducts, allowedStages, init
           const scopeKeys = rows.map((a) => a.stage).filter((k) => k && k !== 'all')
           const hasIssue = overall
             ? cardHasOpenIssue(p)
-            : cardHasOpenIssueInStages(p, scopeKeys.length > 0 ? scopeKeys : PIPE_STAGES.map((s) => s.k))
+            : cardHasOpenIssueInStages(p, scopeKeys.length > 0 ? scopeKeys : ALL_PIPE_KEYS)
 
           if (assignTab === 'completed' && (!fullyApproved || hasIssue)) return false
           if (assignTab === 'pending' && (fullyApproved || hasIssue)) return false
@@ -404,49 +517,146 @@ export default function Products({ products, allDivProducts, allowedStages, init
       if (filterMember && assignTab !== 'completed' && assignTab !== 'pending') {
         if (filterMember === myMemberId) {
           if (!myOwnSkus.has(sku)) return false
-        } else {
-          const ms = memberStats.find((m) => m.id === filterMember)
-          if (!ms || !ms.skus.has(sku)) return false
-        }
+        } else if (!filterMemberStats || !filterMemberStats.skus.has(sku)) return false
       }
       return true
     })
-    .sort((a, b) => {
-      if (sortBy === 'recent') return new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0)
-      if (sortBy === 'oldest') return new Date(a.updatedAt || 0) - new Date(b.updatedAt || 0)
-      if (sortBy === 'pct_high') return productPct(b) - productPct(a)
-      if (sortBy === 'pct_low') return productPct(a) - productPct(b)
-      if (sortBy === 'sku') return (a.sku || '').localeCompare(b.sku || '')
-      return 0
-    })
+
+    if (sortBy === 'recent') result.sort((a, b) => ts(b.updatedAt) - ts(a.updatedAt))
+    else if (sortBy === 'oldest') result.sort((a, b) => ts(a.updatedAt) - ts(b.updatedAt))
+    else if (sortBy === 'pct_high') result.sort((a, b) => productPct(b) - productPct(a))
+    else if (sortBy === 'pct_low') result.sort((a, b) => productPct(a) - productPct(b))
+    else if (sortBy === 'sku') result.sort((a, b) => (a.sku || '').localeCompare(b.sku || ''))
+    return result
+  }, [
+    sourceProducts,
+    deferredQ,
+    fStatus,
+    fEventType,
+    fEventFrom,
+    fEventTo,
+    fStage,
+    fStageStatus,
+    fAssignee,
+    fSetNo,
+    fVendor,
+    fHasIssue,
+    fStalledDays,
+    fQcVerdict,
+    fCompletion,
+    assignTab,
+    filterMember,
+    sortBy,
+    stageFilterOptions,
+    skuAssignDates,
+    skuAssignedTo,
+    rowsFor,
+    myRowsFor,
+    myOwnSkus,
+    memberStatsById,
+    myStageKeysOnCard,
+    cardHasOpenIssueForMe,
+    myMemberId,
+    isMasterOrAdmin,
+    hasAssignAccess,
+    auth,
+  ])
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
-  const pageItems = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const safePage = Math.min(page, totalPages)
+  const pageItems = useMemo(
+    () => filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE),
+    [filtered, safePage]
+  )
 
-  /* ---------- tab counts ---------- */
-  const tabCount = (k) => {
+  /* ---------- tab counts (computed once, not 4× per render) ---------- */
+  const tabCounts = useMemo(() => {
+    const out = {}
     if (!hasAssignAccess && myMemberId) {
       const withRows = products.map((p) => [p, myRowsFor(p)])
-      if (k === 'notassigned') return withRows.filter(([, r]) => r.length === 0).length
-      if (k === 'assigned') return dbMemberStats ? Number(dbMemberStats.total_assigned) : withRows.filter(([, r]) => r.length > 0).length
-      const want = k === 'completed'
-      if (dbMemberStats) return Number(dbMemberStats[k])
-      return withRows.filter(([p, r]) => r.length > 0 && stagesDoneFor(p, r) === want && !cardHasOpenIssue(p)).length
+      const assignedCnt = withRows.filter(([, r]) => r.length > 0).length
+      out.notassigned = withRows.length - assignedCnt
+      out.assigned = dbMemberStats ? Number(dbMemberStats.total_assigned) : assignedCnt
+      for (const k of ['completed', 'pending']) {
+        const want = k === 'completed'
+        out[k] = dbMemberStats
+          ? Number(dbMemberStats[k])
+          : withRows.filter(([p, r]) => r.length > 0 && stagesDoneFor(p, r) === want && !cardHasOpenIssue(p)).length
+      }
+      return out
     }
-    if (!hasAssignAccess) return undefined
+    if (!hasAssignAccess) return out
 
-    if (k === 'notassigned') return products.filter((p) => !skuAssignedTo[lc(p.sku)]).length
-    const field = k === 'assigned' ? 'total' : k
-    if (filterMember) {
-      const ms = dbAllMemberStats?.find((m) => m.memberId === filterMember)
-      return ms ? ms[field] : 0
+    out.notassigned = products.filter((p) => !skuAssignedTo[lc(p.sku)]).length
+    for (const k of ['assigned', 'completed', 'pending']) {
+      const field = k === 'assigned' ? 'total' : k
+      if (filterMember) {
+        const ms = dbAllMemberStats?.find((m) => m.memberId === filterMember)
+        out[k] = ms ? ms[field] : 0
+      } else if (!isMasterOrAdmin && dbMemberStats) {
+        out[k] = Number(dbMemberStats[{ assigned: 'total_assigned', completed: 'completed', pending: 'pending' }[k]])
+      } else if (isMasterOrAdmin && masterCardCounts) {
+        out[k] = masterCardCounts[k]
+      } else {
+        out[k] = (dbAllMemberStats || EMPTY).reduce((s, m) => s + m[field], 0)
+      }
     }
-    if (!isMasterOrAdmin && dbMemberStats) {
-      return Number(dbMemberStats[{ assigned: 'total_assigned', completed: 'completed', pending: 'pending' }[k]])
+    return out
+  }, [
+    hasAssignAccess,
+    myMemberId,
+    products,
+    myRowsFor,
+    dbMemberStats,
+    skuAssignedTo,
+    filterMember,
+    dbAllMemberStats,
+    isMasterOrAdmin,
+    masterCardCounts,
+  ])
+
+  /* ---------- card status chip counts ---------- */
+  const statusCounts = useMemo(() => {
+    let issue = 0
+    let prog = 0
+    let none = 0
+    for (const p of sourceProducts) {
+      issue += countCardIssueInstances(p, myStageKeysOnCard(p))
+      if (!cardHasOpenIssueForMe(p)) {
+        const st = productState(p)
+        if (st === 'prog') prog++
+        else if (st === 'none') none++
+      }
     }
-    if (isMasterOrAdmin && masterCardCounts) return masterCardCounts[k]
-    return (dbAllMemberStats || []).reduce((s, m) => s + m[field], 0)
-  }
+    return { '': sourceProducts.length, issue, prog, none }
+  }, [sourceProducts, myStageKeysOnCard, cardHasOpenIssueForMe])
+
+  /* ---------- per-stage status summary next to the stage dropdown ---------- */
+  const stageStatusSummary = useMemo(() => {
+    if (!fStage) return ''
+    const counts = {}
+    for (const p of sourceProducts) {
+      const st = p.stages?.[fStage]?.status
+      if (st) counts[st] = (counts[st] || 0) + 1
+    }
+    return STATUSES.filter((s) => counts[s] > 0)
+      .map((s) => `${s}: ${counts[s]}`)
+      .join(' · ')
+  }, [sourceProducts, fStage])
+
+  /* ---------- search suggestions ---------- */
+  const suggestions = useMemo(() => {
+    if (!showSug || !deferredQ) return EMPTY
+    const needle = deferredQ.toLowerCase()
+    const out = []
+    for (const p of products) {
+      if (`${p.sku} ${p.name || ''} ${p.vendor || ''}`.toLowerCase().includes(needle)) {
+        out.push(p)
+        if (out.length === 8) break
+      }
+    }
+    return out
+  }, [showSug, deferredQ, products])
 
   /* ---------- filters bookkeeping ---------- */
   const activeFilterCount = [
@@ -482,11 +692,13 @@ export default function Products({ products, allDivProducts, allowedStages, init
   }
   const resetPage = () => setPage(1)
 
-  /* ---------- bulk stage update ---------- */
-  const selectedIds = Object.keys(selected).filter((id) => selected[id])
-  const toggleSelect = (id) => setSelected((s) => ({ ...s, [id]: !s[id] }))
+  /* ---------- open / select (stable callbacks for memoized rows) ---------- */
+  const toggleOpen = useCallback((id) => setOpen((o) => ({ ...o, [id]: !o[id] })), [])
+  const toggleSelect = useCallback((id) => setSelected((s) => ({ ...s, [id]: !s[id] })), [])
   const clearSelect = () => setSelected({})
+  const selectedIds = useMemo(() => Object.keys(selected).filter((id) => selected[id]), [selected])
 
+  /* ---------- bulk stage update ---------- */
   const applyBulk = async () => {
     if (!bulkStage || selectedIds.length === 0) return
     setBulkBusy(true)
@@ -565,7 +777,7 @@ export default function Products({ products, allDivProducts, allowedStages, init
                 fontSize: 13,
               }}
             >
-              {n} <span style={{ opacity: 0.7, marginLeft: 4 }}>{tabCount(k)}</span>
+              {n} <span style={{ opacity: 0.7, marginLeft: 4 }}>{tabCounts[k]}</span>
             </button>
           ))}
         </div>
@@ -703,39 +915,31 @@ export default function Products({ products, allDivProducts, allowedStages, init
           <div>
             <div style={sectionLabel}>Card status</div>
             <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-              {(() => {
-                const counts = {
-                  '': sourceProducts.length,
-                  issue: sourceProducts.reduce((sum, p) => sum + countCardIssueInstances(p, myStageKeysOnCard(p)), 0),
-                  prog: sourceProducts.filter((p) => !cardHasOpenIssueForMe(p) && productState(p) === 'prog').length,
-                  none: sourceProducts.filter((p) => !cardHasOpenIssueForMe(p) && productState(p) === 'none').length,
-                }
-                return [
-                  ['', 'All'],
-                  ['issue', '⚠ With issues'],
-                  ['prog', '… In production'],
-                  ['none', '○ Not started'],
-                ].map(([k, label]) => (
-                  <button
-                    key={k || 'all'}
-                    onClick={() => {
-                      setFStatus(k)
-                      resetPage()
-                    }}
-                    style={{
-                      padding: '7px 14px',
-                      borderRadius: 999,
-                      fontSize: 12,
-                      fontWeight: 600,
-                      background: fStatus === k ? 'var(--ink)' : 'var(--card-2)',
-                      color: fStatus === k ? '#fff' : 'var(--ink)',
-                      border: `1px solid ${fStatus === k ? 'var(--ink)' : 'var(--line2)'}`,
-                    }}
-                  >
-                    {label} <span style={{ opacity: 0.7, marginLeft: 4 }}>{counts[k]}</span>
-                  </button>
-                ))
-              })()}
+              {[
+                ['', 'All'],
+                ['issue', '⚠ With issues'],
+                ['prog', '… In production'],
+                ['none', '○ Not started'],
+              ].map(([k, label]) => (
+                <button
+                  key={k || 'all'}
+                  onClick={() => {
+                    setFStatus(k)
+                    resetPage()
+                  }}
+                  style={{
+                    padding: '7px 14px',
+                    borderRadius: 999,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    background: fStatus === k ? 'var(--ink)' : 'var(--card-2)',
+                    color: fStatus === k ? '#fff' : 'var(--ink)',
+                    border: `1px solid ${fStatus === k ? 'var(--ink)' : 'var(--line2)'}`,
+                  }}
+                >
+                  {label} <span style={{ opacity: 0.7, marginLeft: 4 }}>{statusCounts[k]}</span>
+                </button>
+              ))}
             </div>
           </div>
 
@@ -775,16 +979,7 @@ export default function Products({ products, allDivProducts, allowedStages, init
                   </option>
                 ))}
               </select>
-              {fStage && (
-                <span style={{ fontSize: 11.5, color: 'var(--muted)' }}>
-                  {STATUSES.map((s) => {
-                    const n = sourceProducts.filter((p) => p.stages?.[fStage]?.status === s).length
-                    return n > 0 ? `${s}: ${n}` : null
-                  })
-                    .filter(Boolean)
-                    .join(' · ')}
-                </span>
-              )}
+              {fStage && <span style={{ fontSize: 11.5, color: 'var(--muted)' }}>{stageStatusSummary}</span>}
               {fStage && (
                 <button
                   className="ghost"
@@ -1032,7 +1227,7 @@ export default function Products({ products, allDivProducts, allowedStages, init
         </span>
         {(fCompletion || filterMember) && (
           <span style={{ fontSize: 11.5, color: 'var(--muted)' }}>
-            {filterMember ? `for ${teamMembers.find((m) => m.id === filterMember)?.name || 'selected member'}` : ''}
+            {filterMember ? `for ${memberById.get(filterMember)?.name || 'selected member'}` : ''}
             {fCompletion ? ` · ${fCompletion === 'completed' ? 'Completed' : 'Pending'}` : ''}
           </span>
         )}
@@ -1053,103 +1248,95 @@ export default function Products({ products, allDivProducts, allowedStages, init
             onBlur={() => setTimeout(() => setShowSug(false), 150)}
             onFocus={() => q && setShowSug(true)}
           />
-          {showSug &&
-            q.length > 0 &&
-            (() => {
-              const sugs = products
-                .filter((p) => `${p.sku} ${p.name || ''} ${p.vendor || ''}`.toLowerCase().includes(q.toLowerCase()))
-                .slice(0, 8)
-              if (sugs.length === 0) return null
-              return (
-                <div
-                  style={{
-                    position: 'absolute',
-                    top: 'calc(100% + 6px)',
-                    left: 0,
-                    right: 0,
-                    background: 'var(--card)',
-                    border: '1px solid var(--line2)',
-                    borderRadius: 12,
-                    boxShadow: 'var(--shadow-lg)',
-                    zIndex: 50,
-                    overflow: 'hidden',
-                  }}
-                >
-                  {sugs.map((p) => {
-                    const info = skuAssignedTo[lc(p.sku)] || []
-                    const unique = [...new Map(info.map((a) => [a.memberId, a])).values()]
-                    return (
-                      <div
-                        key={p.id}
-                        onMouseDown={() => {
-                          setQ(p.sku)
-                          setShowSug(false)
-                        }}
-                        style={{
-                          display: 'flex',
-                          flexDirection: 'column',
-                          gap: 5,
-                          padding: '9px 14px',
-                          cursor: 'pointer',
-                          borderBottom: '1px solid var(--line)',
-                        }}
-                        onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--card-2)')}
-                        onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--card)')}
-                      >
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                          <CopySku sku={p.sku} style={{ flexShrink: 0 }} />
-                          {p.name && <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)' }}>{p.name}</span>}
-                          {p.vendor && <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>{p.vendor}</span>}
-                          {p.set_no && (
+          {showSug && q.length > 0 && suggestions.length > 0 && (
+            <div
+              style={{
+                position: 'absolute',
+                top: 'calc(100% + 6px)',
+                left: 0,
+                right: 0,
+                background: 'var(--card)',
+                border: '1px solid var(--line2)',
+                borderRadius: 12,
+                boxShadow: 'var(--shadow-lg)',
+                zIndex: 50,
+                overflow: 'hidden',
+              }}
+            >
+              {suggestions.map((p) => {
+                const info = skuAssignedTo[lc(p.sku)] || EMPTY
+                const unique = [...new Map(info.map((a) => [a.memberId, a])).values()]
+                return (
+                  <div
+                    key={p.id}
+                    onMouseDown={() => {
+                      setQ(p.sku)
+                      setShowSug(false)
+                    }}
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 5,
+                      padding: '9px 14px',
+                      cursor: 'pointer',
+                      borderBottom: '1px solid var(--line)',
+                    }}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--card-2)')}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = 'var(--card)')}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <CopySku sku={p.sku} style={{ flexShrink: 0 }} />
+                      {p.name && <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ink)' }}>{p.name}</span>}
+                      {p.vendor && <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 'auto' }}>{p.vendor}</span>}
+                      {p.set_no && (
+                        <span
+                          className="psku"
+                          style={{ background: 'var(--peach-bg)', color: 'var(--peach-ink)', border: '1px solid var(--peach)', flexShrink: 0 }}
+                        >
+                          {p.set_no}
+                        </span>
+                      )}
+                    </div>
+                    {unique.length > 0 ? (
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, paddingLeft: 2 }}>
+                        {unique.map((a, i) => {
+                          const member = memberById.get(a.memberId)
+                          const stageNames = info
+                            .filter((x) => x.memberId === a.memberId)
+                            .map((x) => STAGES.find((st) => st.k === x.stage)?.n || x.stage)
+                          return (
                             <span
-                              className="psku"
-                              style={{ background: 'var(--peach-bg)', color: 'var(--peach-ink)', border: '1px solid var(--peach)', flexShrink: 0 }}
+                              key={i}
+                              style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: 4,
+                                fontSize: 10.5,
+                                fontWeight: 600,
+                                background: 'var(--sky-bg)',
+                                color: 'var(--sky-ink)',
+                                border: '1px solid var(--sky)',
+                                borderRadius: 6,
+                                padding: '2px 8px',
+                              }}
                             >
-                              {p.set_no}
+                              → {a.memberName}
+                              {member?.role && <span style={{ fontWeight: 400, color: 'var(--muted)', fontSize: 10 }}>· {member.role}</span>}
+                              {stageNames.length > 0 && (
+                                <span style={{ fontWeight: 400, fontSize: 10, opacity: 0.8 }}>({stageNames.join(', ')})</span>
+                              )}
                             </span>
-                          )}
-                        </div>
-                        {unique.length > 0 ? (
-                          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, paddingLeft: 2 }}>
-                            {unique.map((a, i) => {
-                              const member = teamMembers.find((m) => m.id === a.memberId)
-                              const stageNames = info
-                                .filter((x) => x.memberId === a.memberId)
-                                .map((x) => STAGES.find((st) => st.k === x.stage)?.n || x.stage)
-                              return (
-                                <span
-                                  key={i}
-                                  style={{
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: 4,
-                                    fontSize: 10.5,
-                                    fontWeight: 600,
-                                    background: 'var(--sky-bg)',
-                                    color: 'var(--sky-ink)',
-                                    border: '1px solid var(--sky)',
-                                    borderRadius: 6,
-                                    padding: '2px 8px',
-                                  }}
-                                >
-                                  → {a.memberName}
-                                  {member?.role && <span style={{ fontWeight: 400, color: 'var(--muted)', fontSize: 10 }}>· {member.role}</span>}
-                                  {stageNames.length > 0 && (
-                                    <span style={{ fontWeight: 400, fontSize: 10, opacity: 0.8 }}>({stageNames.join(', ')})</span>
-                                  )}
-                                </span>
-                              )
-                            })}
-                          </div>
-                        ) : (
-                          <div style={{ fontSize: 10.5, color: 'var(--faint)', paddingLeft: 2 }}>Not assigned to anyone</div>
-                        )}
+                          )
+                        })}
                       </div>
-                    )
-                  })}
-                </div>
-              )
-            })()}
+                    ) : (
+                      <div style={{ fontSize: 10.5, color: 'var(--faint)', paddingLeft: 2 }}>Not assigned to anyone</div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1216,44 +1403,23 @@ export default function Products({ products, allDivProducts, allowedStages, init
           <div className="plist">
             {pageItems.map((p) => {
               const sku = lc(p.sku)
-              // narrow to the stages this person was assigned on this card
-              const cardStages = myAssignedStagesPerSku?.[p.sku.toLowerCase()]
-              const effectiveAllowedStages =
-                cardStages && cardStages.size > 0
-                  ? allowedStages
-                    ? allowedStages.filter((s) => cardStages.has(s))
-                    : [...cardStages]
-                  : allowedStages
-              // member-level done/pending for their own stages (no QC gate)
-              const memberComplete =
-                cardStages && cardStages.size > 0 ? [...cardStages].every((k) => p.stages?.[k]?.status === 'Completed') : null
-              const memberStages = filterMember
-                ? assignments
-                    .filter((a) => a.memberId === filterMember && a.division === division && lc(a.sku) === sku)
-                    .map((a) => ({
-                      stage: a.stage,
-                      stageName: STAGES.find((s) => s.k === a.stage)?.n || a.stage,
-                      stageStatus: p.stages?.[a.stage]?.status || 'Not Started',
-                      memberId: a.memberId,
-                    }))
-                : []
-
               return (
-                <ProductRow
+                <MemoRow
                   key={p.id}
                   p={p}
-                  open={!!open[p.id]}
-                  toggle={() => setOpen((o) => ({ ...o, [p.id]: !o[p.id] }))}
+                  isOpen={!!open[p.id]}
+                  isSelected={!!selected[p.id]}
+                  onToggleId={toggleOpen}
+                  onSelectId={toggleSelect}
                   onStage={patchStage}
                   onQC={patchQC}
                   onRemove={removeProduct}
-                  allowedStages={effectiveAllowedStages}
-                  selected={!!selected[p.id]}
-                  onSelect={() => toggleSelect(p.id)}
+                  allowedStages={allowedStages}
+                  cardStages={myAssignedStagesPerSku?.[sku]}
+                  skuRows={rowsFor(sku)}
+                  filterMember={filterMember}
                   operator={operator}
                   assignedTo={skuAssignedTo[sku]}
-                  memberStages={memberStages}
-                  memberComplete={memberComplete}
                 />
               )
             })}
@@ -1262,14 +1428,14 @@ export default function Products({ products, allDivProducts, allowedStages, init
           {/* pagination */}
           {totalPages > 1 && (
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6, marginTop: 16, flexWrap: 'wrap' }}>
-              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={page === 1} onClick={() => setPage(1)}>
+              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={safePage === 1} onClick={() => setPage(1)}>
                 «
               </button>
-              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={page === 1} onClick={() => setPage((n) => n - 1)}>
+              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={safePage === 1} onClick={() => setPage(safePage - 1)}>
                 ‹ Prev
               </button>
               {Array.from({ length: totalPages }, (_, i) => i + 1)
-                .filter((n) => n === 1 || n === totalPages || Math.abs(n - page) <= 2)
+                .filter((n) => n === 1 || n === totalPages || Math.abs(n - safePage) <= 2)
                 .reduce((acc, n, i, arr) => {
                   if (i > 0 && n - arr[i - 1] > 1) acc.push('...')
                   acc.push(n)
@@ -1289,8 +1455,8 @@ export default function Products({ products, allDivProducts, allowedStages, init
                         fontSize: 12,
                         borderRadius: 10,
                         border: '1px solid var(--line2)',
-                        background: page === n ? 'var(--ink)' : 'var(--card)',
-                        color: page === n ? '#fff' : 'var(--ink)',
+                        background: safePage === n ? 'var(--ink)' : 'var(--card)',
+                        color: safePage === n ? '#fff' : 'var(--ink)',
                         fontWeight: 600,
                       }}
                     >
@@ -1298,14 +1464,14 @@ export default function Products({ products, allDivProducts, allowedStages, init
                     </button>
                   )
                 )}
-              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={page === totalPages} onClick={() => setPage((n) => n + 1)}>
+              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={safePage === totalPages} onClick={() => setPage(safePage + 1)}>
                 Next ›
               </button>
-              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={page === totalPages} onClick={() => setPage(totalPages)}>
+              <button className="ghost" style={{ padding: '7px 12px', fontSize: 12 }} disabled={safePage === totalPages} onClick={() => setPage(totalPages)}>
                 »
               </button>
               <span style={{ fontSize: 12, color: 'var(--muted)', marginLeft: 4 }}>
-                {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, filtered.length)} of {filtered.length}
+                {(safePage - 1) * PAGE_SIZE + 1}–{Math.min(safePage * PAGE_SIZE, filtered.length)} of {filtered.length}
               </span>
             </div>
           )}

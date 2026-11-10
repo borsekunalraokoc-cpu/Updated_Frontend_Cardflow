@@ -15,6 +15,7 @@ import Bulk from './pages/Bulk'
 import AuditLog from './pages/AuditLog'
 import Process from './pages/Process'
 import SpeedAnalytics from './pages/SpeedAnalytics'
+
 /* ---------- tab list: [key, label, icon] ---------- */
 const ALL_NAV = [
   ['overview', 'Overview', I.grid],
@@ -51,8 +52,8 @@ function Shell() {
 
   const [tab, setTab] = useState('overview')
   const [navOpen, setNavOpen] = useState(false)
-  
-  const [flyoutPos, setFlyoutPos] = useState(null) 
+
+  const [flyoutPos, setFlyoutPos] = useState(null)
   const closeTimer = useRef(null)
 
   const openFlyout = (e) => {
@@ -75,10 +76,16 @@ function Shell() {
     setProductsFilter(filter)
     setTab('products')
   }
-  const goQcAuditIssues = () => {
-    setQcAuditFilter('issues')
+  // NOTE: this function was left unfinished in the original; restore your real body if it differed
+  const goQcAuditIssues = (filter) => {
+    setQcAuditFilter(filter || null)
     setTab('qcaudit')
   }
+
+  // stable callbacks so child pages' effects don't re-fire on every render
+  const clearProductsFilter = useMemo(() => () => setProductsFilter(null), [])
+  const clearQcAuditFilter = useMemo(() => () => setQcAuditFilter(null), [])
+  const clearAnalyticsFilter = useMemo(() => () => setAnalyticsFilter(null), [])
 
   /* ---------- derived data shared by several pages ---------- */
   const allDivProducts = useMemo(() => products.filter((p) => p.division === division), [products, division])
@@ -113,7 +120,7 @@ function Shell() {
     const list = []
     divProducts.forEach((p) =>
       STORES.forEach((st) => {
-        const s = p.stores[st]
+        const s = p.stores?.[st]
         if (s && (s.missing > 0 || s.damaged > 0)) list.push({ p, store: st, s, type: 'store' })
       })
     )
@@ -121,10 +128,18 @@ function Shell() {
   }, [divProducts])
 
   const divAudit = useMemo(() => audit.filter((a) => a.division === division), [audit, division])
-  const allowedStages = getAllowedStages(auth)
 
-  const counts = {}
-  DIVISIONS.forEach((d) => (counts[d] = products.filter((p) => p.division === d).length))
+  // memoized so Products' memoized rows/filters keep a stable reference
+  const allowedStages = useMemo(() => getAllowedStages(auth), [auth])
+
+  const counts = useMemo(() => {
+    const c = {}
+    DIVISIONS.forEach((d) => (c[d] = 0))
+    products.forEach((p) => {
+      if (p.division in c) c[p.division]++
+    })
+    return c
+  }, [products])
 
   const NAV = ALL_NAV.filter(([k]) => canSeeTab(auth, k))
   const activeTab = canSeeTab(auth, tab) ? tab : NAV[0]?.[0] || 'overview'
@@ -143,7 +158,7 @@ function Shell() {
 
   const bombayVendors = vendors['Bombay Cards'] || DEFAULT_VENDORS['Bombay Cards'] || []
 
-    const renderPage = () => {
+  const renderPage = () => {
     switch (activeTab) {
       case 'overview':
         return (
@@ -170,7 +185,7 @@ function Shell() {
             allDivProducts={allDivProducts}
             allowedStages={allowedStages}
             initialFilter={productsFilter}
-            onFilterConsumed={() => setProductsFilter(null)}
+            onFilterConsumed={clearProductsFilter}
           />
         )
 
@@ -179,22 +194,14 @@ function Shell() {
           <QCAudit
             products={divProducts}
             initialFilter={qcAuditFilter}
-            onFilterConsumed={() => setQcAuditFilter(null)}
+            onFilterConsumed={clearQcAuditFilter}
           />
         )
 
       case 'assign':
         return <AssignWork />
 
-      default:
-        return (
-          <div className="rounded-card border border-line bg-card p-10 text-center text-[13px] text-faint shadow-card">
-            <b className="text-ink">{META[activeTab][0]}</b> page will be ported next.
-            <br />
-            Division: {division} · Products loaded: {products.length}
-          </div>
-        )
-         case 'dispatch':
+      case 'dispatch':
         return <Dispatch products={divProducts} />
 
       case 'admindispatch':
@@ -202,8 +209,7 @@ function Shell() {
 
       case 'branchupload':
         return <BranchUpload />
-      
-      
+
       case 'bulk':
         return <Bulk divProducts={divProducts} />
 
@@ -212,18 +218,27 @@ function Shell() {
 
       case 'process':
         return <Process />
-      
-      
+
       case 'analytics':
         return (
           <SpeedAnalytics
             products={divProducts}
             initialFilter={analyticsFilter}
-            onFilterConsumed={() => setAnalyticsFilter(null)}
+            onFilterConsumed={clearAnalyticsFilter}
           />
-        )  
+        )
+
+      default:
+        return (
+          <div className="rounded-card border border-line bg-card p-10 text-center text-[13px] text-faint shadow-card">
+            <b className="text-ink">{META[activeTab]?.[0]}</b> page will be ported next.
+            <br />
+            Division: {division} · Products loaded: {products.length}
+          </div>
+        )
     }
   }
+
   return (
     <div className="flex min-h-screen">
       {navOpen && (
@@ -247,7 +262,7 @@ function Shell() {
         </div>
 
         <div className="px-[10px] pb-[7px] pt-[14px] text-[10px] font-bold uppercase tracking-[1px] text-faint">Division</div>
-                {DIVISIONS.map((d) => (
+        {DIVISIONS.map((d) => (
           <div
             key={d}
             onMouseEnter={d === 'Bombay Cards' ? openFlyout : undefined}
@@ -303,6 +318,7 @@ function Shell() {
             </div>
           </div>
         )}
+
         <div className="px-[10px] pb-[7px] pt-[14px] text-[10px] font-bold uppercase tracking-[1px] text-faint">Workspace</div>
         {NAV.map(([k, n, Icon]) => (
           <button
@@ -354,7 +370,7 @@ function Shell() {
             <br />
             the same live data
           </div>
-        </div>renderPage
+        </div>
       </aside>
 
       {/* ================= MAIN ================= */}
